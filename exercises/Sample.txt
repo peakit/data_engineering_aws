@@ -1,0 +1,3 @@
+In the snapshot above, it shows that the bucket is in the Region: US East (Ohio) us-east-2, and it has a unique Amazon resource name (ARN): arn:aws:s3:::mtvbucket. You can view more details of the bucket, in the tabs next to the bucket overview: Objects, Properties, Permissions, Metrics, Management, and Access points. Leet's upload a sample file to the bucket:
+
+Click on the Upload button to upload files and folders into the current bucket. In the snapshot below, we have uploaded a Sample.txt file.
