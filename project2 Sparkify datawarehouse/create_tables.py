@@ -1,13 +1,21 @@
+import os
+from pathlib import Path
 import configparser
 import boto3
+from botocore.exceptions import ClientError
 import json
 import time
 import psycopg2
-from sql_queries import create_table_queries, drop_table_queries
+from sql_queries import create_table_queries, drop_table_queries, create_schema_query
 
 REDSHIFT_CLIENT = None
 IAM_CLIENT = None
 EC2_CLIENT = None
+
+def create_schema(cur, conn):
+    for query in create_schema_query:
+        cur.execute(query)
+        conn.commit()
 
 
 def drop_tables(cur, conn):
@@ -64,7 +72,7 @@ def is_redshift_available(config, current_status=None):
         clusters = current_status.get('Clusters')
         for cl in clusters:
             if cl.get('ClusterIdentifier') == config.get('CLUSTER', 'CLUSTER_IDENTIFIER'):
-                if cl.get('ClusterStatus') == 'Available':
+                if cl.get('ClusterStatus') == 'available':
                     return True
                 else:
                     return False
@@ -100,32 +108,35 @@ def get_ec2_client(config):
         EC2_CLIENT = boto3.resource('ec2',
                                     region_name=config.get(
                                         'AWS', 'REGION_NAME'),
-                                    aws_key_id=config.get('AWS', 'KEY'),
-                                    aws_secret_access_id=config.get(
+                                    aws_access_key_id=config.get('AWS', 'KEY'),
+                                    aws_secret_access_key=config.get(
                                         'AWS', 'SECRET')
                                     )
     return EC2_CLIENT
 
 
-def open_tcp_ingress_to_cluster(config, cluster):
+def open_tcp_ingress_to_cluster(config):
     """
     Opens a TCP ingress to the redshift cluster at the port
-    specified in the configuration. The cluster parameter
-    is used to refer to the JSON response from cluster 
-    creation/describe API.
+    specified in the configuration. Once the ingress is opened,
+    it then returns the cluster properties.
     """
-
-    vpc = get_ec2_client(config).Vpc(id=cluster['Cluster']
-                                     ['Endpoint']['VpcEndpoints'][0]['VpcId'])
+    cluster_properties = describe_redshift(config)
+    vpc = get_ec2_client(config).Vpc(id=cluster_properties['Clusters'][0]['VpcId'])
     defaultSg = list(vpc.security_groups.all())[0]
-
-    defaultSg.authorize_ingress(
-        GroupName=defaultSg.group_name,
-        CidrIp='0.0.0.0/0',
-        IpProtocol='TCP',
-        FromPort=int(config.get('CLUSTER', 'DB_PORT')),
-        ToPort=int(config.get('CLUSTER', 'DB_PORT'))
-    )
+    try:
+        defaultSg.authorize_ingress(
+            GroupName=defaultSg.group_name,
+            CidrIp='0.0.0.0/0',
+            IpProtocol='TCP',
+            FromPort=int(config.get('CLUSTER', 'DB_PORT')),
+            ToPort=int(config.get('CLUSTER', 'DB_PORT'))
+        )
+    except ClientError as err:
+        if err.response['Error']['Code'] == 'InvalidPermission.Duplicate':
+            # means that the right ingress is already there; do nothing
+            pass;
+    return cluster_properties
 
 
 def get_iam_client(config):
@@ -147,7 +158,12 @@ def get_role(config):
     """
     If the role is already created then gets that.
     """
-    return get_iam_client(config).get_role(RoleName=config.get('IAM_ROLE', 'DWH_IAM_ROLE_NAME'))
+    role = None
+    try:
+        role = get_iam_client(config).get_role(RoleName=config.get('IAM_ROLE', 'DWH_IAM_ROLE_NAME'))
+    except Exception as e:
+        print("No existing role found.")
+    return role
 
 
 def attach_s3_full_access_policy(config):
@@ -185,8 +201,8 @@ def get_or_create_iam_role(config):
                 ]
             }),
             Description='Allows redshift to assume this role and access s3')
+        attach_s3_full_access_policy(config)
 
-    attach_s3_full_access_policy(config)
     return role
 
 
@@ -198,7 +214,7 @@ def create_redshift_cluster(config, roleArn):
     resp = get_redshift_client(config).create_cluster(
         ClusterType=config['CLUSTER']['CLUSTER_TYPE'],
         NodeType=config['CLUSTER']['NODE_TYPE'],
-        NumberOfNodes=int(config['CLUSTER']['HOST']),
+        NumberOfNodes=int(config['CLUSTER']['NUM_HOST']),
         DBName=config['CLUSTER']['DB_NAME'],
         MasterUsername=config['CLUSTER']['DB_USER'],
         MasterUserPassword=config['CLUSTER']['DB_PASSWORD'],
@@ -219,26 +235,42 @@ def get_or_create_redshift(config):
     # return response
     # 4 open tcp ingress to the cluster
     try:
-        resp = describe_redshift(config)
+        describe_redshift(config)
     except Exception as e:
-        role = get_or_create_iam_role(config)
-        resp = create_redshift_cluster(config, role['Role']['Arn'])
+        if e.response['Error']['Code'] == 'ClusterNotFound':
+            role = get_or_create_iam_role(config)
+            create_redshift_cluster(config, role['Role']['Arn'])
 
-    if not is_redshift_available(config, resp):
+    if not is_redshift_available(config):
         wait_for_availability(config, retry_interval=30, timeout=600)
-    open_tcp_ingress_to_cluster(config, resp)
+    cluster_properties = open_tcp_ingress_to_cluster(config)
+    
+    return cluster_properties
 
 
 def main():
-    config = configparser.ConfigParser()
-    config.read('dwh.cfg')
+    path = Path(__file__)
+    ROOT_DIR = path.parent.absolute()
+    config_path = os.path.join(ROOT_DIR, "dwh.cfg")
 
-    redshift_resp = get_or_create_redshift(config)
-    conn = psycopg2.connect("host={} dbname={} user={} password={} port={}".format(
-        *config['CLUSTER'].values()))
+    config = configparser.ConfigParser()
+    config.read(config_path)
+
+    cluster_props = get_or_create_redshift(config)
+    cluster_endpoint_address = cluster_props['Clusters'][0]['Endpoint']['Address']
+    print("Redshift cluster endpoint: ", cluster_endpoint_address)
+    conn = psycopg2.connect(
+                "host={} dbname={} user={} password={} port={}" \
+                    .format(cluster_endpoint_address,
+                            config.get('CLUSTER','DB_NAME'),
+                            config.get('CLUSTER', 'DB_USER'),
+                            config.get('CLUSTER', 'DB_PASSWORD'),
+                            config.get('CLUSTER', 'DB_PORT'))
+                            )
 
     cur = conn.cursor()
 
+    create_schema(cur, conn)
     drop_tables(cur, conn)
     create_tables(cur, conn)
 
