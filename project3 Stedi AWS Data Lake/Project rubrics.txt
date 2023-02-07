@@ -1,0 +1,6 @@
+1. customer_trusted (after removing PII)
+2. accelerometer_trusted -> accelerometer_landing x customer_trusted (acc data for trusted cust)
+3. customer_curated -> customer_trusted x accelerometer_trusted (trusted cust who have acc data)
+4. step_trainer_trusted -> step_trainer_landing x customer_curated (step train data for cust who have accelerometer data as well)
+5. machine_learning_curated -> step_trainer_trusted x customer_curated x accelerometer_trusted
+
